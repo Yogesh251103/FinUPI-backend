@@ -1,794 +1,747 @@
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
-import matplotlib.pyplot as plt
-import seaborn as sns
-import networkx as nx
-from sklearn.preprocessing import MinMaxScaler
-import pickle
-import os
-import random
+"""
+Credit Scoring Module
 
-class FinUPICreditScoreModel:
+This module calculates credit scores based on transaction features.
+It provides functions for generating scores, explaining components,
+and determining loan eligibility.
+"""
+
+import numpy as np
+from typing import Dict, List, Tuple, Optional
+import json
+
+
+class CreditScoreCalculator:
     """
-    FinUPI Credit Score Model for analyzing UPI transactions and generating credit scores.
-    
-    This model analyzes various parameters from UPI transaction data:
-    - Counterparty diversity
-    - Transaction amounts
-    - Transaction patterns
-    - Circular transaction detection
-    - Time-based patterns
+    Class to calculate and explain credit scores based on transaction features.
     """
     
-    def __init__(self):
-        self.model_weights = {
-            'counterparty_diversity': 0.10,       # Further reduced - gig workers often have fewer partners
-            'amount_entropy': 0.05,               # Kept low as gig workers often have similar payments 
-            'transaction_frequency': 0.30,        # Increased even more - regular income is critical
-            'credit_debit_ratio': 0.30,           # Increased for strong cash flow indication
-            'circular_transaction_flag': -0.05,   # Reduced penalty for suspicious patterns
-            'transaction_time_entropy': 0.05,     # Unchanged
-            'transaction_growth': 0.15,           # Maintains importance of growing income
-            'average_transaction_size': 0.05,     # Kept same
-            'max_transaction_limit': 0.00,        # Removed as not relevant for micro-loans
-            'merchant_type_diversity': 0.05       # Unchanged
+    def _init_(self):
+        """Initialize the CreditScoreCalculator class."""
+        # Define component weights
+        self.income_weight = 0.25
+        self.expense_weight = 0.25
+        self.discipline_weight = 0.25
+        self.history_weight = 0.25
+        
+        # Define score thresholds for explanations
+        self.score_thresholds = {
+            "excellent": 90,
+            "good": 75,
+            "fair": 60,
+            "poor": 40,
+            "very_poor": 0
         }
         
-        self.scaler = MinMaxScaler(feature_range=(0, 100))
-        
-    def preprocess_transactions(self, transactions_data):
-        """
-        Preprocess raw UPI transaction data into a pandas DataFrame with the necessary structure.
-        
-        Args:
-            transactions_data: List of transaction records or pandas DataFrame
-            
-        Returns:
-            DataFrame with cleaned and preprocessed transactions
-        """
-        if isinstance(transactions_data, list):
-            df = pd.DataFrame(transactions_data)
-        else:
-            df = transactions_data.copy()
-        
-        # Map column names if using the gigworker excel format
-        if 'Transaction ID' in df.columns and 'Timestamp' in df.columns:
-            column_mapping = {
-                'Transaction ID': 'id',
-                'Timestamp': 'date',
-                'Receiver Name': 'merchant',
-                'Amount (INR)': 'amount',
-                'Sender Name': 'sender'
-            }
-            df = df.rename(columns=column_mapping)
-            
-            # Determine transaction type based on sender/receiver UPI IDs
-            # If the user is the sender, it's a debit transaction
-            if 'Sender UPI ID' in df.columns and 'Receiver UPI ID' in df.columns:
-                # Assuming transactions from the user's UPI ID are 'debit'
-                # First, find the most common sender UPI ID (likely the user's)
-                user_upi = df['Sender UPI ID'].value_counts().idxmax()
-                df['type'] = df.apply(
-                    lambda row: 'debit' if row['Sender UPI ID'] == user_upi else 'credit', 
-                    axis=1
-                )
-            else:
-                # Fallback: randomly assign transaction types for testing
-                # In real implementation, this should be determined from the data
-                df['type'] = np.random.choice(['credit', 'debit'], size=len(df), p=[0.4, 0.6])
-                
-            # Add category if not present
-            if 'category' not in df.columns:
-                # Assign categories based on merchants (just for demo)
-                merchants = df['merchant'].unique()
-                categories = ["Sales", "Purchases", "Utilities", "Food", "Transport", "Services"]
-                merchant_categories = {
-                    merchant: random.choice(categories)
-                    for merchant in merchants
-                }
-                df['category'] = df['merchant'].map(merchant_categories)
-                
-            # Filter out failed transactions if status column exists
-            if 'Status' in df.columns:
-                df = df[df['Status'] == 'SUCCESS']
-            
-        # Convert date strings to datetime objects if needed
-        if isinstance(df['date'].iloc[0], str):
-            df['date'] = pd.to_datetime(df['date'])
-            
-        # Ensure amount is numeric
-        df['amount'] = pd.to_numeric(df['amount'])
-        
-        # Add a normalized timestamp for time pattern analysis
-        df['hour_of_day'] = df['date'].dt.hour
-        df['day_of_week'] = df['date'].dt.dayofweek
-        
-        # Sort by date
-        df = df.sort_values('date')
-        
-        # Add transaction direction column (1 for incoming, -1 for outgoing)
-        df['direction'] = df['type'].apply(lambda x: 1 if x == 'credit' else -1)
-        
-        return df
-        
-    def analyze_counterparty_diversity(self, df):
-        """
-        Analyzes the diversity of counterparties in the transaction data.
-        Higher diversity is generally better for credit score.
-        
-        Returns:
-            float: Normalized diversity score (0-100)
-        """
-        # Count unique merchants/counterparties
-        unique_counterparties = df['merchant'].nunique()
-        total_transactions = len(df)
-        
-        # Shannon entropy of merchant distribution
-        merchant_counts = df['merchant'].value_counts(normalize=True)
-        entropy = -sum(merchant_counts * np.log2(merchant_counts))
-        
-        # Normalize to 0-100 scale - boosted for gig workers
-        normalized_entropy = min(100, entropy * 35)  # Increased scaling factor (was 25)
-        
-        # Balance between unique count and entropy - boost for gig workers
-        # Even with few merchants, give a higher base score
-        diversity_score = 0.6 * normalized_entropy + 0.4 * min(100, unique_counterparties * 20)
-        
-        # Minimum score floor for gig workers
-        return max(60, diversity_score)  # Minimum score of 60
-    
-    def analyze_amount_entropy(self, df):
-        """
-        Analyzes the diversity and distribution of transaction amounts.
-        Higher entropy (more diverse amounts) can indicate healthy financial activity.
-        
-        Returns:
-            float: Normalized amount entropy score (0-100)
-        """
-        # Create bins for transaction amounts
-        amount_bins = pd.cut(df['amount'], bins=10)
-        bin_counts = amount_bins.value_counts(normalize=True)
-        
-        # Calculate entropy if we have enough data
-        if len(bin_counts) > 1:
-            entropy = -sum(bin_counts * np.log2(bin_counts.clip(lower=1e-10)))
-            # Normalize to 0-100 scale
-            normalized_entropy = min(100, entropy * 33)  # Scale factor determined empirically
-        else:
-            normalized_entropy = 50  # Default value if not enough data
-            
-        return normalized_entropy
-    
-    def detect_circular_transactions(self, df):
-        """
-        Detects potential circular transactions which could indicate suspicious activity.
-        
-        Returns:
-            float: Circular transaction flag score (0-100, lower is better)
-        """
-        # Create a directed graph of transactions
-        G = nx.DiGraph()
-        
-        # Extract sender-receiver pairs (simplified, as we're working with mock data)
-        # In real implementation, we would extract actual UPI IDs
-        for _, row in df.iterrows():
-            if row['type'] == 'debit':
-                sender = 'user'
-                receiver = row['merchant']
-                G.add_edge(sender, receiver, amount=row['amount'])
-            else:
-                sender = row['merchant']
-                receiver = 'user'
-                G.add_edge(sender, receiver, amount=row['amount'])
-        
-        # Look for cycles in the graph
-        try:
-            cycles = list(nx.simple_cycles(G))
-            cycle_score = min(100, len(cycles) * 25)  # Scale factor
-        except:
-            cycle_score = 0  # No cycles detected
-            
-        return cycle_score
-    
-    def analyze_transaction_frequency(self, df):
-        """
-        Analyzes transaction frequency patterns.
-        Regular transaction activity is positive for credit score.
-        
-        Returns:
-            float: Transaction frequency score (0-100)
-        """
-        # Calculate transactions per day
-        date_range = (df['date'].max() - df['date'].min()).days + 1
-        if date_range < 1:
-            date_range = 1  # Avoid division by zero
-            
-        transactions_per_day = len(df) / date_range
-        
-        # Score based on transactions per day - more generous for gig workers
-        # Even low frequency gets a decent score
-        frequency_score = min(100, 50 + transactions_per_day * 25)  # Base score of 50 + scaling
-        
-        return frequency_score
-    
-    def analyze_credit_debit_ratio(self, df):
-        """
-        Analyzes the ratio between credit (incoming) and debit (outgoing) transactions.
-        A healthy balance is good for credit score.
-        
-        Returns:
-            float: Credit-debit ratio score (0-100)
-        """
-        # Calculate total credit and debit amounts
-        credit_amount = df[df['type'] == 'credit']['amount'].sum()
-        debit_amount = df[df['type'] == 'debit']['amount'].sum()
-        
-        # Avoid division by zero
-        if debit_amount == 0:
-            ratio = 5.0  # Arbitrary high value if no debits
-        else:
-            ratio = credit_amount / debit_amount
-            
-        # Balanced ratio - more forgiving for gig workers
-        if ratio < 0.8:  # Was 1.0, now more forgiving of higher expenses
-            ratio_score = 40 + ratio * 50  # Minimum 40 points, was ratio * 70
-        else:
-            ratio_score = 100 - min(20, (ratio - 1) * 5)  # Less penalty for high income, was -10
-            
-        return max(40, ratio_score)  # Minimum score of 40
-    
-    def analyze_transaction_time_patterns(self, df):
-        """
-        Analyzes the entropy of transaction times throughout the day and week.
-        Regular patterns can indicate stability.
-        
-        Returns:
-            float: Transaction time entropy score (0-100)
-        """
-        # Calculate entropy of hour distribution
-        hour_counts = df['hour_of_day'].value_counts(normalize=True)
-        if len(hour_counts) > 1:
-            hour_entropy = -sum(hour_counts * np.log2(hour_counts.clip(lower=1e-10)))
-        else:
-            hour_entropy = 0
-            
-        # Calculate entropy of day of week distribution
-        day_counts = df['day_of_week'].value_counts(normalize=True)
-        if len(day_counts) > 1:
-            day_entropy = -sum(day_counts * np.log2(day_counts.clip(lower=1e-10)))
-        else:
-            day_entropy = 0
-            
-        # Combine the two entropies (normalized)
-        time_entropy_score = min(100, (hour_entropy * 10 + day_entropy * 20))
-        
-        return time_entropy_score
-    
-    def analyze_transaction_growth(self, df):
-        """
-        Analyzes the growth trend in transaction volume over time.
-        Healthy growth is positive for credit score.
-        
-        Returns:
-            float: Transaction growth score (0-100)
-        """
-        # Group by week and calculate weekly transaction volume
-        df['week'] = df['date'].dt.isocalendar().week
-        weekly_volume = df.groupby('week')['amount'].sum()
-        
-        if len(weekly_volume) < 2:
-            return 50  # Not enough data for trend analysis
-            
-        # Calculate week-over-week growth rate
-        growth_rates = weekly_volume.pct_change().dropna()
-        
-        # Average growth rate
-        avg_growth = growth_rates.mean()
-        
-        # Score based on growth rate
-        if avg_growth < -0.1:  # Significant decline
-            growth_score = max(0, 50 + avg_growth * 200)
-        elif avg_growth < 0.05:  # Slight decline or stable
-            growth_score = 50 + avg_growth * 400
-        else:  # Growth
-            growth_score = min(100, 70 + avg_growth * 150)
-            
-        return growth_score
-    
-    def analyze_transaction_size(self, df):
-        """
-        Analyzes the average and maximum transaction sizes.
-        
-        Returns:
-            tuple: (avg_transaction_score, max_transaction_score)
-        """
-        avg_amount = df['amount'].mean()
-        max_amount = df['amount'].max()
-        
-        # Score based on average transaction size
-        avg_transaction_score = min(100, avg_amount / 100)
-        
-        # Score based on maximum transaction size
-        max_transaction_score = min(100, max_amount / 1000)
-        
-        return avg_transaction_score, max_transaction_score
-    
-    def analyze_merchant_type_diversity(self, df):
-        """
-        Analyzes the diversity of merchant types/categories in transactions.
-        Higher diversity is generally better for credit score.
-        
-        Returns:
-            float: Normalized diversity score (0-100)
-        """
-        # Simplified mocking of merchant categories
-        # In real implementation, this would use actual merchant category data
-        if 'category' in df.columns:
-            df['merchant_category'] = df['category']
-        else:
-            # Mockup categorization by merchant name
-            unique_merchants = df['merchant'].unique()
-            categories = ["Retail", "Utility", "Food", "Transport", "Entertainment", "Services"]
-            merchant_categories = {
-                merchant: random.choice(categories) 
-                for merchant in unique_merchants
-            }
-            df['merchant_category'] = df['merchant'].map(merchant_categories)
-        
-        # Calculate category diversity
-        category_counts = df['merchant_category'].value_counts(normalize=True)
-        
-        if len(category_counts) > 1:
-            category_entropy = -sum(category_counts * np.log2(category_counts))
-            diversity_score = min(100, category_entropy * 40)  # Scale factor
-        else:
-            diversity_score = 30  # Low score for single category
-            
-        return diversity_score
-    
-    def separate_transactions_by_type(self, transactions_data):
-        """
-        Separates transactions into sender and receiver categories.
-        
-        Args:
-            transactions_data: List of transaction records or pandas DataFrame
-            
-        Returns:
-            dict: Dictionary with 'sent', 'received', and 'by_receiver' keys containing DataFrames
-        """
-        # Preprocess the data
-        df = self.preprocess_transactions(transactions_data)
-        
-        # Separate by transaction type (debit = sent, credit = received)
-        sent_transactions = df[df['type'] == 'debit'].copy()
-        received_transactions = df[df['type'] == 'credit'].copy()
-        
-        # Group transactions by receiver (merchant)
-        transactions_by_receiver = {}
-        for merchant in df['merchant'].unique():
-            merchant_df = df[df['merchant'] == merchant].copy()
-            transactions_by_receiver[merchant] = merchant_df
-            
-        return {
-            'sent': sent_transactions,
-            'received': received_transactions,
-            'by_receiver': transactions_by_receiver
+        # Define features relevant to each component
+        self.component_features = {
+            "income": ["monthly_income", "income_frequency", "income_regularity", "income_sources", "income_growth"],
+            "expense": ["monthly_expense", "expense_to_income_ratio", "essential_expense_ratio", "expense_consistency", "large_expense_frequency"],
+            "discipline": ["savings_ratio", "low_balance_frequency", "balance_dips", "weekend_spending_ratio"],
+            "history": ["transaction_frequency", "merchant_diversity", "data_months", "high_risk_merchant_ratio"]
         }
-    
-    def aggregate_transactions_by_receiver(self, transactions_data):
-        """
-        Aggregates transaction data by receiver (merchant).
         
-        Args:
-            transactions_data: List of transaction records or pandas DataFrame
+        # Feature importance within each component (must sum to 1 within each component)
+        self.feature_weights = {
+            # Income stability weights
+            "monthly_income": 0.3,
+            "income_frequency": 0.15,
+            "income_regularity": 0.3,
+            "income_sources": 0.15,
+            "income_growth": 0.1,
             
-        Returns:
-            DataFrame: Aggregated statistics for each receiver
-        """
-        # Preprocess the data
-        df = self.preprocess_transactions(transactions_data)
+            # Expense management weights
+            "monthly_expense": 0.15,
+            "expense_to_income_ratio": 0.40,
+            "essential_expense_ratio": 0.20,
+            "expense_consistency": 0.15,
+            "large_expense_frequency": 0.10,
+            
+            # Financial discipline weights
+            "savings_ratio": 0.40,
+            "low_balance_frequency": 0.25,
+            "balance_dips": 0.25,
+            "weekend_spending_ratio": 0.10,
+            
+            # Transaction history weights
+            "transaction_frequency": 0.25,
+            "merchant_diversity": 0.25,
+            "data_months": 0.35,
+            "high_risk_merchant_ratio": 0.15
+        }
         
-        # Group by merchant and calculate statistics
-        aggregated = df.groupby('merchant').agg({
-            'amount': ['count', 'sum', 'mean', 'min', 'max'],
-            'type': lambda x: (x == 'credit').mean() * 100,  # Percentage of credit transactions
-            'date': [
-                lambda x: (x.max() - x.min()).days,  # Date range in days
-                lambda x: x.dt.hour.mean(),          # Average hour of transactions
-                'first', 'last'                      # First and last transaction dates
+        # Define feature scaling functions
+        self.feature_scalers = {
+            # Income stability scalers
+            "monthly_income": lambda x: min(1.0, x / 50000),  # Scale income up to 50k
+            "income_frequency": lambda x: min(1.0, x / 30),   # Scale up to 30 transactions per month
+            "income_regularity": lambda x: x,                 # Already between 0-1
+            "income_sources": lambda x: min(1.0, x / 3),      # Scale up to 3 sources
+            "income_growth": lambda x: min(1.0, max(0, (x + 0.1) / 0.2)),  # Scale -0.1 to 0.1 growth
+            
+            # Expense management scalers
+            "monthly_expense": lambda x, monthly_income: 1.0 - min(1.0, x / (monthly_income + 0.01)),  # Lower is better
+            "expense_to_income_ratio": lambda x: 1.0 - x,     # Lower is better
+            "essential_expense_ratio": lambda x: min(1.0, max(0, 1.25 * x - 0.25)),  # Optimal around 0.6-0.8
+            "expense_consistency": lambda x: x,               # Already between 0-1
+            "large_expense_frequency": lambda x: 1.0 - min(1.0, x / 5), # Lower is better
+            
+            # Financial discipline scalers
+            "savings_ratio": lambda x: min(1.0, x / 0.2),     # Scale up to 20% savings
+            "low_balance_frequency": lambda x: 1.0 - x,       # Lower is better
+            "balance_dips": lambda x: 1.0 - x,                # Lower is better
+            "weekend_spending_ratio": lambda x: min(1.0, max(0, 1.5 - x / 1.5)), # Optimal around 0.5-1.0
+            
+            # Transaction history scalers
+            "transaction_frequency": lambda x: min(1.0, x / 2),  # Scale up to 2 transactions per day
+            "merchant_diversity": lambda x: x,                  # Already between 0-1
+            "data_months": lambda x: min(1.0, x / 3),           # Scale up to 3 months
+            "high_risk_merchant_ratio": lambda x: 1.0 - min(1.0, x * 10)  # Lower is better, severe penalty
+        }
+        
+        # Define improvement recommendations for each feature
+        self.improvement_recommendations = {
+            "monthly_income": [
+                "Consider exploring additional income sources",
+                "Look for opportunities to increase your primary income"
+            ],
+            "income_frequency": [
+                "More frequent income patterns can improve your score",
+                "Consider breaking down large income deposits into smaller, more regular amounts"
+            ],
+            "income_regularity": [
+                "Regular, predictable income improves your creditworthiness",
+                "Try to establish a consistent income pattern"
+            ],
+            "income_sources": [
+                "Multiple income sources reduce financial risk",
+                "Consider diversifying your income streams"
+            ],
+            "income_growth": [
+                "A positive income trend strengthens your financial profile",
+                "Focus on increasing your income over time"
+            ],
+            "expense_to_income_ratio": [
+                "Try to keep your expenses below 70% of your income",
+                "Reducing non-essential expenses can improve your score"
+            ],
+            "essential_expense_ratio": [
+                "Maintain a healthy balance between essential and discretionary spending",
+                "Aim for essential expenses to be 60-80% of total expenses"
+            ],
+            "expense_consistency": [
+                "Consistent monthly expenses show financial stability",
+                "Avoid large fluctuations in your spending patterns"
+            ],
+            "large_expense_frequency": [
+                "Minimize large expenses that exceed 25% of your monthly income",
+                "Break down large purchases into smaller amounts if possible"
+            ],
+            "savings_ratio": [
+                "Try to save at least 20% of your income",
+                "Increasing your savings rate demonstrates financial discipline"
+            ],
+            "low_balance_frequency": [
+                "Avoid maintaining low or negative account balances",
+                "Keep a buffer amount in your account at all times"
+            ],
+            "balance_dips": [
+                "Avoid running out of money just before receiving income",
+                "Better cash flow management can improve your score"
+            ],
+            "weekend_spending_ratio": [
+                "Maintain balanced spending throughout the week",
+                "Excessive weekend spending may indicate poor financial planning"
+            ],
+            "transaction_frequency": [
+                "Regular transaction activity demonstrates active financial management",
+                "Very low transaction counts may limit our ability to assess your habits"
+            ],
+            "merchant_diversity": [
+                "Transacting with a wider variety of merchants shows financial flexibility",
+                "Extremely limited merchant diversity may impact your score"
+            ],
+            "data_months": [
+                "A longer transaction history allows for better assessment",
+                "Continue using your account regularly to build history"
+            ],
+            "high_risk_merchant_ratio": [
+                "Transactions with high-risk merchants can negatively impact your score",
+                "Limit transactions with gambling services and frequent cash withdrawals"
             ]
-        })
-        
-        # Flatten the column names
-        aggregated.columns = ['_'.join(col).strip() for col in aggregated.columns.values]
-        
-        # Rename columns for clarity
-        aggregated = aggregated.rename(columns={
-            'amount_count': 'transaction_count',
-            'amount_sum': 'total_amount',
-            'amount_mean': 'average_amount',
-            'amount_min': 'min_amount',
-            'amount_max': 'max_amount',
-            'type_<lambda_0>': 'percent_credit',
-            'date_<lambda_0>': 'days_active',
-            'date_<lambda_1>': 'average_hour',
-            'date_first': 'first_transaction',
-            'date_last': 'last_transaction'
-        })
-        
-        # Add frequency (transactions per day)
-        aggregated['transactions_per_day'] = aggregated['transaction_count'] / aggregated['days_active'].clip(lower=1)
-        
-        return aggregated
+        }
     
-    def calculate_credit_score(self, transactions_data):
+    def calculate_score(self, features: Dict) -> Dict:
         """
-        Calculates the overall credit score based on all analyzed parameters.
+        Calculate credit score based on transaction features.
         
         Args:
-            transactions_data: List of transaction records or pandas DataFrame
+            features: Dictionary of features extracted from transactions
             
         Returns:
-            dict: Credit score results including overall score and component scores
+            Dict: Credit score and components
         """
-        # Preprocess the data
-        df = self.preprocess_transactions(transactions_data)
+        # Calculate component scores
+        income_score = self._calculate_income_score(features)
+        expense_score = self._calculate_expense_score(features)
+        discipline_score = self._calculate_discipline_score(features)
+        history_score = self._calculate_history_score(features)
         
-        if len(df) == 0:
-            return {'score': 50, 'components': {}, 'message': 'No transaction data available'}
-            
-        # Calculate all component scores
-        counterparty_diversity = self.analyze_counterparty_diversity(df)
-        amount_entropy = self.analyze_amount_entropy(df)
-        circular_transaction_flag = self.detect_circular_transactions(df)
-        transaction_frequency = self.analyze_transaction_frequency(df)
-        credit_debit_ratio = self.analyze_credit_debit_ratio(df)
-        transaction_time_entropy = self.analyze_transaction_time_patterns(df)
-        transaction_growth = self.analyze_transaction_growth(df)
-        avg_transaction_size, max_transaction_limit = self.analyze_transaction_size(df)
-        merchant_type_diversity = self.analyze_merchant_type_diversity(df)
+        # Calculate overall score (weighted average)
+        overall_score = (
+            income_score * self.income_weight +
+            expense_score * self.expense_weight +
+            discipline_score * self.discipline_weight +
+            history_score * self.history_weight
+        ) * 100  # Scale to 0-100
         
-        # Compile all component scores
-        component_scores = {
-            'counterparty_diversity': counterparty_diversity,
-            'amount_entropy': amount_entropy,
-            'transaction_frequency': transaction_frequency,
-            'credit_debit_ratio': credit_debit_ratio,
-            'circular_transaction_flag': 100 - circular_transaction_flag,  # Invert so higher is better
-            'transaction_time_entropy': transaction_time_entropy,
-            'transaction_growth': transaction_growth,
-            'average_transaction_size': avg_transaction_size,
-            'max_transaction_limit': max_transaction_limit,
-            'merchant_type_diversity': merchant_type_diversity
-        }
+        # Round to nearest integer
+        overall_score = round(overall_score)
         
-        # Calculate weighted score
-        weighted_score = sum(
-            component_scores[component] * weight 
-            for component, weight in self.model_weights.items()
-        )
+        # Apply minimum score floor of 55 to ensure loan eligibility
+        overall_score = max(55, overall_score)
         
-        # Determine credit level and loan eligibility
-        credit_level = self._determine_credit_level(weighted_score)
-        loan_eligibility = self._calculate_loan_eligibility(weighted_score, df)
+        # Generate score category
+        score_category = self._get_score_category(overall_score)
         
-        # Prepare the result
+        # Generate explanations and recommendations
+        explanations = self._generate_explanations(features, {
+            "income": income_score,
+            "expense": expense_score,
+            "discipline": discipline_score,
+            "history": history_score
+        })
+        
+        # Calculate loan eligibility
+        loan_eligibility = self._calculate_loan_eligibility(overall_score, features)
+        
+        # Prepare result
         result = {
-            'score': round(weighted_score),
-            'level': credit_level,
-            'components': component_scores,
-            'loan_eligibility': loan_eligibility,
-            'last_updated': datetime.now().strftime('%Y-%m-%d')
+            "overall_score": overall_score,
+            "score_category": score_category,
+            "component_scores": {
+                "income_stability": round(income_score * 100),
+                "expense_management": round(expense_score * 100),
+                "financial_discipline": round(discipline_score * 100),
+                "transaction_history": round(history_score * 100)
+            },
+            "explanations": explanations,
+            "loan_eligibility": loan_eligibility
         }
         
         return result
     
-    def _determine_credit_level(self, score):
-        """Determines the credit level based on the score."""
-        if score >= 80:
-            return "Excellent"
-        elif score >= 70:
-            return "Very Good"
-        elif score >= 60:
-            return "Good"
-        elif score >= 45:  # Lowered from 50
-            return "Fair"
-        elif score >= 30:  # Lowered from 35
-            return "Poor"
-        else:
-            return "Very Poor"
-    
-    def _calculate_loan_eligibility(self, score, df):
+    def _calculate_income_score(self, features: Dict) -> float:
         """
-        Calculates loan eligibility for gig workers with micro loans.
-        Loan range: 10,000 to 2,00,000 INR
-        Interest rates: 1-3% at onboarding
-        """
-        # Calculate average monthly credit transactions
-        if len(df) > 0 and 'date' in df.columns:
-            # Determine date range in months
-            date_range = (df['date'].max() - df['date'].min()).days / 30
-            if date_range < 0.5:  # Less than 15 days of data
-                date_range = 0.5
-                
-            # Calculate monthly income estimate (from credit transactions)
-            monthly_income = df[df['type'] == 'credit']['amount'].sum() / date_range
-            
-            # For very low transaction volumes, apply a higher minimum threshold
-            if len(df) < 10:
-                monthly_income = max(monthly_income, 20000)  # Increased minimum assumed income
-        else:
-            monthly_income = 20000  # Increased default assumption for gig workers
-            
-        # Calculate monthly surplus (income - expenses)
-        if len(df) > 0:
-            monthly_expenses = df[df['type'] == 'debit']['amount'].sum() / date_range
-            monthly_surplus = max(1000, monthly_income - monthly_expenses)  # Ensure minimum surplus
-        else:
-            # Default assumption if we don't have expense data
-            monthly_surplus = monthly_income * 0.3  # Assume 30% surplus
-        
-        # Base loan limit calculation - much more generous for gig workers
-        if score >= 80:
-            loan_limit = min(monthly_income * 8, 200000)  # Increased from 5x to 8x
-            interest_rate = 1.0
-            duration_days = 60  # Longer duration
-        elif score >= 70:
-            loan_limit = min(monthly_income * 6, 150000)  # Increased from 4x to 6x
-            interest_rate = 1.5
-            duration_days = 45
-        elif score >= 60:
-            loan_limit = min(monthly_income * 5, 120000)  # Increased from 3x to 5x
-            interest_rate = 2.0
-            duration_days = 45
-        elif score >= 45:  # Lowered threshold and increased multiplier
-            loan_limit = min(monthly_income * 3, 80000)  # Was 2x, now 3x
-            interest_rate = 2.5
-            duration_days = 30
-        elif score >= 30:
-            loan_limit = min(monthly_income * 2, 40000)  # Was 1x, now 2x
-            interest_rate = 3.0
-            duration_days = 30
-        else:
-            loan_limit = min(monthly_income * 1, 20000)  # Increased minimum loan
-            interest_rate = 3.0
-            duration_days = 30
-        
-        # Ensure minimum loan amount of 15,000 if they qualify
-        if score >= 30:
-            loan_limit = max(loan_limit, 15000)  # Increased from 10k to 15k
-            
-        # Ensure loan limit is at least equal to monthly surplus for scores above 45
-        if score >= 45:
-            loan_limit = max(loan_limit, monthly_surplus * duration_days / 30)
-            
-        return {
-            'max_loan_amount': round(loan_limit, -3),  # Round to nearest thousand
-            'interest_rate': interest_rate,
-            'max_duration_days': duration_days  # Variable duration based on score
-        }
-    
-    def generate_report(self, transactions_data, output_file=None):
-        """
-        Generates a comprehensive credit score report including visualizations.
+        Calculate income stability component score.
         
         Args:
-            transactions_data: List of transaction records or pandas DataFrame
-            output_file: If provided, saves the report to this file
+            features: Dictionary of features
             
         Returns:
-            dict: Credit score results and report path if saved
+            float: Income stability score (0-1)
         """
-        # Calculate credit score
-        results = self.calculate_credit_score(transactions_data)
-        df = self.preprocess_transactions(transactions_data)
+        # Get relevant features
+        monthly_income = features.get("monthly_income", 0)
+        income_frequency = features.get("income_frequency", 0)
+        income_regularity = features.get("income_regularity", 0)
+        income_sources = features.get("income_sources", 0)
+        income_growth = features.get("income_growth", 0)
         
-        # Create visualizations
-        plt.figure(figsize=(15, 10))
+        # Apply scaling functions
+        scaled_monthly_income = self.feature_scalers["monthly_income"](monthly_income)
+        scaled_income_frequency = self.feature_scalers["income_frequency"](income_frequency)
+        scaled_income_regularity = self.feature_scalers["income_regularity"](income_regularity)
+        scaled_income_sources = self.feature_scalers["income_sources"](income_sources)
+        scaled_income_growth = self.feature_scalers["income_growth"](income_growth)
         
-        # Credit score gauge
-        plt.subplot(2, 3, 1)
-        self._plot_gauge(results['score'], 'Credit Score')
-        
-        # Component scores
-        plt.subplot(2, 3, 2)
-        components = {k: v for k, v in results['components'].items() 
-                     if k in self.model_weights and self.model_weights[k] >= 0.1}
-        self._plot_component_scores(components)
-        
-        # Transaction volume over time
-        plt.subplot(2, 3, 3)
-        self._plot_transaction_volume(df)
-        
-        # Merchant diversity
-        plt.subplot(2, 3, 4)
-        self._plot_merchant_diversity(df)
-        
-        # Credit vs Debit ratio
-        plt.subplot(2, 3, 5)
-        self._plot_credit_debit_ratio(df)
-        
-        # Transaction heatmap by hour and day
-        plt.subplot(2, 3, 6)
-        self._plot_transaction_heatmap(df)
-        
-        plt.tight_layout()
-        
-        # Save to file if requested
-        if output_file:
-            plt.savefig(output_file, dpi=300, bbox_inches='tight')
-            results['report_file'] = output_file
-            
-        plt.close()
-        
-        # Export to Excel
-        if output_file:
-            excel_file = output_file.replace('.png', '.xlsx')
-            self._export_to_excel(df, results, excel_file)
-            results['excel_report'] = excel_file
-            
-        return results
-    
-    def _plot_gauge(self, score, title):
-        """Plots a gauge chart for the credit score."""
-        # Create gauge chart code here
-        plt.pie([score, 100-score], colors=['#2ECC71', '#EAECEE'], 
-                startangle=90, counterclock=False)
-        plt.text(0, 0, f"{int(score)}", ha='center', va='center', fontsize=24, fontweight='bold')
-        plt.title(title)
-        
-    def _plot_component_scores(self, components):
-        """Plots a bar chart of component scores."""
-        plt.barh(list(components.keys()), list(components.values()), color='#3498DB')
-        plt.title('Component Scores')
-        plt.xlim(0, 100)
-        
-    def _plot_transaction_volume(self, df):
-        """Plots transaction volume over time."""
-        if len(df) == 0:
-            plt.text(0.5, 0.5, "No data available", ha='center', va='center')
-            plt.title('Transaction Volume')
-            return
-            
-        # Group by day
-        daily_volume = df.groupby(df['date'].dt.date)['amount'].sum()
-        plt.plot(daily_volume.index, daily_volume.values, marker='o', linestyle='-', color='#9B59B6')
-        plt.title('Daily Transaction Volume')
-        plt.xticks(rotation=45)
-        
-    def _plot_merchant_diversity(self, df):
-        """Plots a pie chart of merchant diversity."""
-        if len(df) == 0:
-            plt.text(0.5, 0.5, "No data available", ha='center', va='center')
-            plt.title('Merchant Diversity')
-            return
-            
-        merchant_counts = df['merchant'].value_counts()
-        plt.pie(merchant_counts, labels=merchant_counts.index, autopct='%1.1f%%')
-        plt.title('Merchant Diversity')
-        
-    def _plot_credit_debit_ratio(self, df):
-        """Plots credit vs debit amounts."""
-        if len(df) == 0:
-            plt.text(0.5, 0.5, "No data available", ha='center', va='center')
-            plt.title('Credit vs Debit')
-            return
-            
-        credit = df[df['type'] == 'credit']['amount'].sum()
-        debit = df[df['type'] == 'debit']['amount'].sum()
-        plt.bar(['Credit', 'Debit'], [credit, debit], color=['#27AE60', '#E74C3C'])
-        plt.title('Credit vs Debit Amounts')
-        
-    def _plot_transaction_heatmap(self, df):
-        """Plots a heatmap of transactions by hour and day of week."""
-        if len(df) == 0:
-            plt.text(0.5, 0.5, "No data available", ha='center', va='center')
-            plt.title('Transaction Timing')
-            return
-            
-        # Create pivot table of transaction counts by hour and day
-        heatmap_data = pd.pivot_table(
-            df, 
-            values='amount',
-            index='day_of_week', 
-            columns='hour_of_day',
-            aggfunc='count',
-            fill_value=0
+        # Calculate weighted score
+        income_score = (
+            scaled_monthly_income * self.feature_weights["monthly_income"] +
+            scaled_income_frequency * self.feature_weights["income_frequency"] +
+            scaled_income_regularity * self.feature_weights["income_regularity"] +
+            scaled_income_sources * self.feature_weights["income_sources"] +
+            scaled_income_growth * self.feature_weights["income_growth"]
         )
         
-        sns.heatmap(heatmap_data, cmap='YlGnBu')
-        plt.title('Transaction Timing Heatmap')
+        return income_score
+    
+    def _calculate_expense_score(self, features: Dict) -> float:
+        """
+        Calculate expense management component score.
         
-    def _export_to_excel(self, df, results, excel_file):
-        """Exports transaction data and results to Excel."""
-        with pd.ExcelWriter(excel_file) as writer:
-            # Transaction data
-            df.to_excel(writer, sheet_name='Transactions', index=False)
+        Args:
+            features: Dictionary of features
             
-            # Credit score results
-            pd.DataFrame({
-                'Metric': ['Credit Score', 'Credit Level', 'Last Updated'],
-                'Value': [results['score'], results['level'], results['last_updated']]
-            }).to_excel(writer, sheet_name='Credit Score', index=False)
-            
-            # Component scores
-            components_df = pd.DataFrame({
-                'Component': list(results['components'].keys()),
-                'Score': list(results['components'].values()),
-                'Weight': [self.model_weights.get(k, 0) for k in results['components'].keys()]
-            })
-            components_df['Weighted Score'] = components_df['Score'] * components_df['Weight']
-            components_df.to_excel(writer, sheet_name='Component Scores', index=False)
-            
-            # Loan eligibility
-            pd.DataFrame({
-                'Metric': ['Maximum Loan Amount', 'Interest Rate', 'Maximum Duration (Days)'],
-                'Value': [
-                    results['loan_eligibility']['max_loan_amount'],
-                    results['loan_eligibility']['interest_rate'],
-                    results['loan_eligibility']['max_duration_days']
-                ]
-            }).to_excel(writer, sheet_name='Loan Eligibility', index=False)
+        Returns:
+            float: Expense management score (0-1)
+        """
+        # Get relevant features
+        monthly_expense = features.get("monthly_expense", 0)
+        expense_to_income_ratio = features.get("expense_to_income_ratio", 1)  # Default to worst case
+        essential_expense_ratio = features.get("essential_expense_ratio", 0)
+        expense_consistency = features.get("expense_consistency", 0)
+        large_expense_frequency = features.get("large_expense_frequency", 5)  # Default to bad case
+        monthly_income = features.get("monthly_income", 1)  # To avoid division by zero
+        
+        # Apply scaling functions
+        scaled_monthly_expense = self.feature_scalers["monthly_expense"](monthly_expense, monthly_income)
+        scaled_expense_ratio = self.feature_scalers["expense_to_income_ratio"](expense_to_income_ratio)
+        scaled_essential_ratio = self.feature_scalers["essential_expense_ratio"](essential_expense_ratio)
+        scaled_expense_consistency = self.feature_scalers["expense_consistency"](expense_consistency)
+        scaled_large_expense_freq = self.feature_scalers["large_expense_frequency"](large_expense_frequency)
+        
+        # Calculate weighted score
+        expense_score = (
+            scaled_monthly_expense * self.feature_weights["monthly_expense"] +
+            scaled_expense_ratio * self.feature_weights["expense_to_income_ratio"] +
+            scaled_essential_ratio * self.feature_weights["essential_expense_ratio"] +
+            scaled_expense_consistency * self.feature_weights["expense_consistency"] +
+            scaled_large_expense_freq * self.feature_weights["large_expense_frequency"]
+        )
+        
+        return expense_score
     
-    def save_model(self, filename='finupi_credit_model.pkl'):
-        """Saves the model to a file."""
-        with open(filename, 'wb') as f:
-            pickle.dump(self, f)
-        return filename
+    def _calculate_discipline_score(self, features: Dict) -> float:
+        """
+        Calculate financial discipline component score.
+        
+        Args:
+            features: Dictionary of features
+            
+        Returns:
+            float: Financial discipline score (0-1)
+        """
+        # Get relevant features
+        savings_ratio = features.get("savings_ratio", 0)
+        low_balance_frequency = features.get("low_balance_frequency", 1)  # Default to worst case
+        balance_dips = features.get("balance_dips", 1)  # Default to worst case
+        weekend_spending_ratio = features.get("weekend_spending_ratio", 2)  # Default to bad case
+        
+        # Apply scaling functions
+        scaled_savings_ratio = self.feature_scalers["savings_ratio"](savings_ratio)
+        scaled_low_balance_freq = self.feature_scalers["low_balance_frequency"](low_balance_frequency)
+        scaled_balance_dips = self.feature_scalers["balance_dips"](balance_dips)
+        scaled_weekend_spending = self.feature_scalers["weekend_spending_ratio"](weekend_spending_ratio)
+        
+        # Calculate weighted score
+        discipline_score = (
+            scaled_savings_ratio * self.feature_weights["savings_ratio"] +
+            scaled_low_balance_freq * self.feature_weights["low_balance_frequency"] +
+            scaled_balance_dips * self.feature_weights["balance_dips"] +
+            scaled_weekend_spending * self.feature_weights["weekend_spending_ratio"]
+        )
+        
+        return discipline_score
     
-    @classmethod
-    def load_model(cls, filename='finupi_credit_model.pkl'):
-        """Loads the model from a file."""
-        with open(filename, 'rb') as f:
-            model = pickle.load(f)
-        return model
+    def _calculate_history_score(self, features: Dict) -> float:
+        """
+        Calculate transaction history component score.
+        
+        Args:
+            features: Dictionary of features
+            
+        Returns:
+            float: Transaction history score (0-1)
+        """
+        # Get relevant features
+        transaction_frequency = features.get("transaction_frequency", 0)
+        merchant_diversity = features.get("merchant_diversity", 0)
+        data_months = features.get("data_months", 0)
+        high_risk_merchant_ratio = features.get("high_risk_merchant_ratio", 0.3)  # Default to bad case
+        
+        # Apply scaling functions
+        scaled_transaction_freq = self.feature_scalers["transaction_frequency"](transaction_frequency)
+        scaled_merchant_diversity = self.feature_scalers["merchant_diversity"](merchant_diversity)
+        scaled_data_months = self.feature_scalers["data_months"](data_months)
+        scaled_high_risk_ratio = self.feature_scalers["high_risk_merchant_ratio"](high_risk_merchant_ratio)
+        
+        # Calculate weighted score
+        history_score = (
+            scaled_transaction_freq * self.feature_weights["transaction_frequency"] +
+            scaled_merchant_diversity * self.feature_weights["merchant_diversity"] +
+            scaled_data_months * self.feature_weights["data_months"] +
+            scaled_high_risk_ratio * self.feature_weights["high_risk_merchant_ratio"]
+        )
+        
+        return history_score
+    
+    def _get_score_category(self, score: float) -> str:
+        """
+        Get the category label for a given score.
+        
+        Args:
+            score: Credit score (0-100)
+            
+        Returns:
+            str: Score category label
+        """
+        if score >= self.score_thresholds["excellent"]:
+            return "excellent"
+        elif score >= self.score_thresholds["good"]:
+            return "good"
+        elif score >= self.score_thresholds["fair"]:
+            return "fair"
+        elif score >= self.score_thresholds["poor"]:
+            return "poor"
+        else:
+            return "very_poor"
+    
+    def _generate_explanations(self, features: Dict, component_scores: Dict) -> Dict:
+        """
+        Generate explanations and improvement recommendations.
+        
+        Args:
+            features: Dictionary of features
+            component_scores: Dictionary of component scores
+            
+        Returns:
+            Dict: Explanations and recommendations
+        """
+        explanations = {}
+        
+        # Generate component explanations
+        explanations["components"] = {
+            "income_stability": self._explain_income_stability(features, component_scores["income"]),
+            "expense_management": self._explain_expense_management(features, component_scores["expense"]),
+            "financial_discipline": self._explain_financial_discipline(features, component_scores["discipline"]),
+            "transaction_history": self._explain_transaction_history(features, component_scores["history"])
+        }
+        
+        # Find weak components for improvement recommendations
+        weak_components = []
+        for component, score in component_scores.items():
+            if score < 0.7:  # Consider components with score < 70% as weak
+                weak_components.append(component)
+        
+        # Generate improvement recommendations
+        explanations["improvement_recommendations"] = self._generate_recommendations(features, weak_components)
+        
+        return explanations
+    
+    def _explain_income_stability(self, features: Dict, score: float) -> Dict:
+        """
+        Generate explanation for income stability component.
+        
+        Args:
+            features: Dictionary of features
+            score: Component score (0-1)
+            
+        Returns:
+            Dict: Explanation
+        """
+        monthly_income = features.get("monthly_income", 0)
+        income_regularity = features.get("income_regularity", 0)
+        income_sources = features.get("income_sources", 0)
+        
+        score_category = "excellent" if score > 0.9 else "good" if score > 0.7 else "fair" if score > 0.5 else "poor"
+        
+        explanation = {
+            "summary": f"Your income stability is {score_category}.",
+            "details": []
+        }
+        
+        if monthly_income > 0:
+            explanation["details"].append(f"Your monthly income is approximately ₹{monthly_income:.0f}.")
+        
+        if income_regularity > 0.8:
+            explanation["details"].append("You have very regular income patterns.")
+        elif income_regularity > 0.5:
+            explanation["details"].append("You have somewhat regular income patterns.")
+        else:
+            explanation["details"].append("Your income patterns are irregular.")
+        
+        if income_sources > 2:
+            explanation["details"].append("You have multiple income sources, which is positive.")
+        elif income_sources > 1:
+            explanation["details"].append("You have more than one income source.")
+        else:
+            explanation["details"].append("You rely on a single income source.")
+        
+        return explanation
+    
+    def _explain_expense_management(self, features: Dict, score: float) -> Dict:
+        """
+        Generate explanation for expense management component.
+        
+        Args:
+            features: Dictionary of features
+            score: Component score (0-1)
+            
+        Returns:
+            Dict: Explanation
+        """
+        expense_ratio = features.get("expense_to_income_ratio", 1)
+        essential_ratio = features.get("essential_expense_ratio", 0)
+        
+        score_category = "excellent" if score > 0.9 else "good" if score > 0.7 else "fair" if score > 0.5 else "poor"
+        
+        explanation = {
+            "summary": f"Your expense management is {score_category}.",
+            "details": []
+        }
+        
+        if expense_ratio < 0.7:
+            explanation["details"].append(f"You spend around {expense_ratio*100:.0f}% of your income, which is good.")
+        elif expense_ratio < 0.9:
+            explanation["details"].append(f"You spend around {expense_ratio*100:.0f}% of your income.")
+        else:
+            explanation["details"].append(f"You spend around {expense_ratio*100:.0f}% of your income, which is high.")
+        
+        if essential_ratio > 0.8:
+            explanation["details"].append("Most of your spending is on essential expenses.")
+        elif essential_ratio > 0.6:
+            explanation["details"].append("You maintain a good balance between essential and non-essential expenses.")
+        else:
+            explanation["details"].append("A large portion of your spending is on non-essential items.")
+        
+        return explanation
+    
+    def _explain_financial_discipline(self, features: Dict, score: float) -> Dict:
+        """
+        Generate explanation for financial discipline component.
+        
+        Args:
+            features: Dictionary of features
+            score: Component score (0-1)
+            
+        Returns:
+            Dict: Explanation
+        """
+        savings_ratio = features.get("savings_ratio", 0)
+        low_balance_frequency = features.get("low_balance_frequency", 1)
+        
+        score_category = "excellent" if score > 0.9 else "good" if score > 0.7 else "fair" if score > 0.5 else "poor"
+        
+        explanation = {
+            "summary": f"Your financial discipline is {score_category}.",
+            "details": []
+        }
+        
+        if savings_ratio > 0.2:
+            explanation["details"].append(f"You save around {savings_ratio*100:.0f}% of your income, which is excellent.")
+        elif savings_ratio > 0.1:
+            explanation["details"].append(f"You save around {savings_ratio*100:.0f}% of your income, which is good.")
+        elif savings_ratio > 0:
+            explanation["details"].append(f"You save around {savings_ratio*100:.0f}% of your income, which could be improved.")
+        else:
+            explanation["details"].append("You are spending more than your income, which is concerning.")
+        
+        if low_balance_frequency < 0.1:
+            explanation["details"].append("You rarely have a low account balance, which is excellent.")
+        elif low_balance_frequency < 0.3:
+            explanation["details"].append("You occasionally have a low account balance.")
+        else:
+            explanation["details"].append(f"You frequently have a low account balance ({low_balance_frequency*100:.0f}% of days).")
+        
+        return explanation
+    
+    def _explain_transaction_history(self, features: Dict, score: float) -> Dict:
+        """
+        Generate explanation for transaction history component.
+        
+        Args:
+            features: Dictionary of features
+            score: Component score (0-1)
+            
+        Returns:
+            Dict: Explanation
+        """
+        data_months = features.get("data_months", 0)
+        merchant_diversity = features.get("merchant_diversity", 0)
+        high_risk_ratio = features.get("high_risk_merchant_ratio", 0)
+        
+        score_category = "excellent" if score > 0.9 else "good" if score > 0.7 else "fair" if score > 0.5 else "poor"
+        
+        explanation = {
+            "summary": f"Your transaction history is {score_category}.",
+            "details": []
+        }
+        
+        if data_months < 1:
+            explanation["details"].append(f"We have only {data_months*30:.0f} days of transaction history.")
+        elif data_months < 3:
+            explanation["details"].append(f"We have {data_months:.1f} months of transaction history.")
+        else:
+            explanation["details"].append(f"We have {data_months:.1f} months of transaction history, which is good.")
+        
+        merchant_count = merchant_diversity * 10  # Approximate, since we normalized by dividing by 10
+        if merchant_count > 5:
+            explanation["details"].append(f"You transact with a diverse set of merchants ({merchant_count:.0f}+ different merchants).")
+        else:
+            explanation["details"].append(f"You transact with a limited set of merchants ({merchant_count:.0f} different merchants).")
+        
+        if high_risk_ratio > 0.05:
+            explanation["details"].append(f"{high_risk_ratio*100:.1f}% of your transactions are with high-risk merchants.")
+        
+        return explanation
+    
+    def _generate_recommendations(self, features: Dict, weak_components: List[str]) -> List[str]:
+        """
+        Generate improvement recommendations for weak components.
+        
+        Args:
+            features: Dictionary of features
+            weak_components: List of component names with low scores
+            
+        Returns:
+            List: Improvement recommendations
+        """
+        recommendations = []
+        
+        # Look for the weakest features within weak components
+        for component in weak_components:
+            component_features = self.component_features.get(component, [])
+            
+            # Get feature scores for this component
+            feature_scores = {}
+            for feature in component_features:
+                if feature in features:
+                    # Calculate normalized feature score (0-1)
+                    if feature == "monthly_expense":
+                        monthly_income = features.get("monthly_income", 1)
+                        score = self.feature_scalers[feature](features[feature], monthly_income)
+                    else:
+                        # Apply appropriate scaling function
+                        try:
+                            score = self.feature_scalers[feature](features[feature])
+                        except TypeError:
+                            # Some scalers might need additional parameters, use default
+                            score = 0.5
+                    
+                    feature_scores[feature] = score
+            
+            # Find the weakest features (lowest scores)
+            weak_features = sorted(feature_scores.items(), key=lambda x: x[1])[:2]
+            
+            # Add recommendations for weak features
+            for feature, score in weak_features:
+                if score < 0.7 and feature in self.improvement_recommendations:
+                    # Randomly select one recommendation for this feature
+                    import random
+                    recommendation = random.choice(self.improvement_recommendations[feature])
+                    recommendations.append(recommendation)
+        
+        # Limit to top 3 recommendations
+        return recommendations[:3]
+    
+    def _calculate_loan_eligibility(self, score: float, features: Dict) -> Dict:
+        """
+        Calculate loan eligibility based on credit score and income.
+        
+        Args:
+            score: Credit score (0-100)
+            features: Dictionary of features
+            
+        Returns:
+            Dict: Loan eligibility details
+        """
+        monthly_income = features.get("monthly_income", 0)
+        expense_ratio = features.get("expense_to_income_ratio", 1)
+        
+        # Calculate disposable income
+        disposable_income = monthly_income * (1 - expense_ratio)
+        
+        # Calculate maximum loan amount (3x monthly income for excellent scores, scaling down for lower scores)
+        # With a minimum floor to ensure everyone gets a fair chance
+        score_factor = max(0.3, score / 100)  # Minimum factor of 0.3 instead of 0.1
+        max_loan_amount = monthly_income * 3 * score_factor
+        
+        # Calculate EMI capacity (50% of disposable income)
+        emi_capacity = disposable_income * 0.5
+        
+        # Calculate interest rate based on score
+        if score >= 90:
+            interest_rate = 12.0
+        elif score >= 80:
+            interest_rate = 14.0
+        elif score >= 70:
+            interest_rate = 16.0
+        elif score >= 60:
+            interest_rate = 18.0
+        elif score >= 50:
+            interest_rate = 20.0
+        else:
+            interest_rate = 22.0  
+        
+        # Calculate maximum loan duration (in months)
+        max_duration = 12
+        
+        # Calculate monthly EMI for maximum loan
+        # Using simple interest for simplicity in microloans
+        monthly_interest_rate = interest_rate / 100 / 12
+        total_interest = max_loan_amount * monthly_interest_rate * max_duration
+        monthly_emi = (max_loan_amount + total_interest) / max_duration
+        
+        # Adjust loan amount if EMI exceeds capacity
+        if monthly_emi > emi_capacity and emi_capacity > 0:
+            # Recalculate max loan amount based on EMI capacity
+            max_loan_amount = (emi_capacity * max_duration) / (1 + monthly_interest_rate * max_duration)
+            monthly_emi = emi_capacity
+        
+        # Round to nearest 1000
+        max_loan_amount = round(max_loan_amount / 1000) * 1000
+        
+        # Set minimum and maximum limits
+        min_loan = 5000
+        absolute_max_loan = 50000
+        
+        max_loan_amount = max(min_loan, min(max_loan_amount, absolute_max_loan))
+        
+        return {
+            "eligible": True,  # Always eligible since we have a floor of 55
+            "max_loan_amount": int(max_loan_amount),
+            "interest_rate": interest_rate,
+            "max_duration_months": max_duration,
+            "monthly_emi": int(monthly_emi),
+            "disposable_income": int(disposable_income)
+        }
 
 
-def process_upi_data(upi_data_file, output_report=None):
+def calculate_credit_score(features: Dict) -> Dict:
     """
-    Process UPI transaction data from a file and generate a credit score report.
+    Calculate credit score based on transaction features.
     
     Args:
-        upi_data_file: Path to CSV, JSON, or Excel file containing UPI transaction data
-        output_report: Path to save the report graphics (optional)
+        features: Dictionary of features extracted from transactions
         
     Returns:
-        dict: Credit score results
+        Dict: Credit score and components
     """
-    # Load the data
-    if upi_data_file.endswith('.csv'):
-        df = pd.read_csv(upi_data_file)
-    elif upi_data_file.endswith('.json'):
-        df = pd.read_json(upi_data_file)
-    elif upi_data_file.endswith('.xlsx') or upi_data_file.endswith('.xls'):
-        df = pd.read_excel(upi_data_file)
-    else:
-        raise ValueError("Unsupported file format. Please use CSV, JSON, or Excel file.")
-    
-    # Create model and generate report
-    model = FinUPICreditScoreModel()
-    
-    if output_report:
-        results = model.generate_report(df, output_report)
-    else:
-        results = model.calculate_credit_score(df)
-    
-    return results
+    calculator = CreditScoreCalculator()
+    return calculator.calculate_score(features)
 
 
-if __name__ == "__main__":
-    # Example usage from command line
-    import sys
-    import json
+if _name_ == "_main_":
+    # Test with sample features
+    from transaction_parser import analyze_transactions
+    from data_ingestion import load_sample_data
     
-    if len(sys.argv) > 1:
-        input_file = sys.argv[1]
-        output_file = sys.argv[2] if len(sys.argv) > 2 else None
-        
-        results = process_upi_data(input_file, output_file)
-        
-        # Print results to console
-        print(json.dumps(results, indent=2))
-    else:
-        print("Usage: python credit_score_model.py <upi_data_file> [output_report_file]") 
+    # Load sample data
+    sample_data = load_sample_data()
+    
+    # Extract features
+    processed_data, features = analyze_transactions(sample_data)
+    
+    # Calculate credit score
+    credit_score_result = calculate_credit_score(features)
+    
+    # Print results
+    print("\nCredit Score Results:")
+    print(f"Overall Score: {credit_score_result['overall_score']} - {credit_score_result['score_category'].capitalize()}")
+    
+    print("\nComponent Scores:")
+    for component, score in credit_score_result['component_scores'].items():
+        print(f"  {component}: {score}")
+    
+    print("\nLoan Eligibility:")
+    loan = credit_score_result['loan_eligibility']
+    print(f"  Eligible: {loan['eligible']}")
+    print(f"  Maximum Loan: ₹{loan['max_loan_amount']:,}")
+    print(f"  Interest Rate: {loan['interest_rate']}%")
+    print(f"  Max Duration: {loan['max_duration_months']} months")
+    print(f"  Monthly EMI: ₹{loan['monthly_emi']:,}")
+    
+    print("\nImprovement Recommendations:")
+    for rec in credit_score_result['explanations']['improvement_recommendations']:
+        print(f"  - {rec}")
